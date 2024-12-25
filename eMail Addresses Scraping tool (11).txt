@@ -1,0 +1,149 @@
+import os
+import requests
+from bs4 import BeautifulSoup
+import random
+import time
+import csv
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from email_validator import validate_email, EmailNotValidError
+
+# Logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Proxy and User-Agent lists from environment variables
+PROXIES = os.getenv("PROXIES", "").split(",")
+USER_AGENTS = os.getenv("USER_AGENTS", "").split(",")
+
+# Validate and clean email addresses
+def validate_email_address(email):
+    try:
+        valid = validate_email(email).email
+        return valid
+    except EmailNotValidError:
+        return None
+
+# Function to test proxy connectivity
+def test_proxies():
+    working_proxies = []
+    for proxy in PROXIES:
+        try:
+            response = requests.get("http://httpbin.org/ip", proxies={"http": proxy, "https": proxy}, timeout=5)
+            if response.status_code == 200:
+                working_proxies.append(proxy)
+        except Exception:
+            logging.warning(f"Proxy failed: {proxy}")
+    return working_proxies
+
+# Scrape emails from a single URL
+def scrape_emails_from_url(url, proxies):
+    proxy = random.choice(proxies)
+    user_agent = random.choice(USER_AGENTS)
+    headers = {"User-Agent": user_agent}
+    retries = 3  # Retry logic
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=headers, proxies={"http": proxy, "https": proxy}, timeout=10)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            emails = set()
+            for mailto in soup.select("a[href^=mailto]"):
+                email = mailto.get("href").replace("mailto:", "").strip()
+                valid_email = validate_email_address(email)
+                if valid_email:
+                    emails.add(valid_email)
+            return emails
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Attempt {attempt + 1} failed for {url} using proxy {proxy}: {e}")
+            if attempt < retries - 1:
+                proxy = random.choice(proxies)  # Rotate proxy
+                time.sleep(random.uniform(1, 3))  # Delay before retry
+        except Exception as e:
+            logging.error(f"Unexpected error for {url} on attempt {attempt + 1}: {e}")
+            break
+    return set()
+
+# Multi-threaded scraping
+def scrape_multiple_urls(urls, proxies, include_domains=None, exclude_domains=None):
+    all_emails = set()
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_url = {executor.submit(scrape_emails_from_url, url, proxies): url for url in urls}
+        for future in future_to_url:
+            url = future_to_url[future]
+            try:
+                emails = future.result()
+                # Filter emails by domain
+                if include_domains or exclude_domains:
+                    emails = {
+                        email for email in emails
+                        if (not include_domains or any(email.endswith(domain) for domain in include_domains)) and
+                           (not exclude_domains or not any(email.endswith(domain) for domain in exclude_domains))
+                    }
+                all_emails.update(emails)
+                logging.info(f"Scraped {len(emails)} emails from {url}")
+            except Exception as e:
+                logging.error(f"Error scraping {url}: {e}")
+    return all_emails
+
+# Save results to a CSV file
+def save_to_csv(emails, output_file):
+    try:
+        with open(output_file, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["Email"])
+            for email in sorted(emails):
+                writer.writerow([email])
+        logging.info(f"Emails successfully saved to {output_file}")
+    except IOError as e:
+        logging.error(f"Failed to save emails to CSV: {e}")
+
+# Validate user inputs
+def validate_urls(urls):
+    valid_urls = []
+    for url in urls:
+        if url.startswith("http://") or url.startswith("https://"):
+            valid_urls.append(url)
+        else:
+            logging.warning(f"Invalid URL skipped: {url}")
+    return valid_urls
+
+if __name__ == "__main__":
+    # User inputs
+    input_urls = input("Enter URLs separated by commas: ").split(",")
+    input_urls = [url.strip() for url in input_urls]
+    input_urls = validate_urls(input_urls)
+
+    if not input_urls:
+        logging.error("No valid URLs provided. Exiting.")
+        exit()
+
+    output_file = input("Enter the output CSV file name: ").strip()
+    if not output_file.endswith(".csv"):
+        logging.warning("Output file name must end with .csv. Appending .csv...")
+        output_file += ".csv"
+
+    include_domains = input("Enter domains to include (comma-separated, leave blank for all): ").split(",")
+    include_domains = [domain.strip() for domain in include_domains if domain.strip()]
+    exclude_domains = input("Enter domains to exclude (comma-separated, leave blank for none): ").split(",")
+    exclude_domains = [domain.strip() for domain in exclude_domains if domain.strip()]
+
+    logging.info("Testing proxies...")
+    working_proxies = test_proxies()
+
+    if not working_proxies:
+        logging.error("No working proxies available. Exiting.")
+    else:
+        logging.info(f"Using {len(working_proxies)} working proxies.")
+
+        # Start scraping
+        logging.info("Starting email scraping...")
+        emails = scrape_multiple_urls(input_urls, working_proxies, include_domains, exclude_domains)
+
+        if emails:
+            # Save results
+            logging.info(f"Saving {len(emails)} emails to CSV...")
+            save_to_csv(emails, output_file)
+            logging.info(f"Scraping complete. Emails saved to {output_file}.")
+        else:
+            logging.warning("No emails found during scraping.")
